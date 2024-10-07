@@ -5,6 +5,7 @@
 from odoo import models, fields, api, _
 from odoo.tools.safe_eval import safe_eval
 from dateutil.relativedelta import relativedelta
+from odoo.exceptions import UserError
 import logging
 _logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ class ResCompanyInterest(models.Model):
         'Interest Product',
         required=True,
     )
-    analytic_line_ids = fields.Many2one(
+    analytic_account_id = fields.Many2one(
         'account.analytic.account',
         'Analytic account',
     )
@@ -82,13 +83,30 @@ class ResCompanyInterest(models.Model):
     def _cron_recurring_interests_invoices(self):
         _logger.info('Running Interest Invoices Cron Job')
         current_date = fields.Date.today()
-        self.search([('next_date', '<=', current_date)]).create_interest_invoices()
+        companies_with_errors = []
+
+        for rec in self.search([('next_date', '<=', current_date)]):
+            try:
+                rec.create_interest_invoices()
+                rec.env.cr.commit()
+            except:
+                _logger.error('Error creating interest invoices for company: %s', rec.company_id.name)
+                companies_with_errors.append(rec.company_id.name)
+                rec.env.cr.rollback()
+                
+        if companies_with_errors:
+            company_names = ', '.join(companies_with_errors)
+            error_message = _("We couldn't run interest invoices cron job in the following companies: %s.") % company_names
+            raise UserError(error_message)
+
 
     def create_interest_invoices(self):
         for rec in self:
             _logger.info(
                 'Creating Interest Invoices (id: %s, company: %s)', rec.id,
                 rec.company_id.name)
+            # hacemos un commit para refrescar cache
+            self.env.cr.commit()
             interests_date = rec.next_date
 
             rule_type = rec.rule_type
@@ -114,7 +132,9 @@ class ResCompanyInterest(models.Model):
             # para lo que vencio en este ultimo periodo
             to_date = interests_date - tolerance_delta
             from_date = to_date - tolerance_delta
-            rec.with_context(default_l10n_ar_afip_asoc_period_start=from_date,
+            # llamamos a crear las facturas con la compañia del interes para
+            # que tome correctamente las cuentas
+            rec.with_company(rec.company_id).with_context(default_l10n_ar_afip_asoc_period_start=from_date,
                              default_l10n_ar_afip_asoc_period_end=to_date).create_invoices(to_date)
 
             # seteamos proxima corrida en hoy mas un periodo
@@ -134,10 +154,6 @@ class ResCompanyInterest(models.Model):
     def create_invoices(self, to_date, groupby='partner_id'):
         self.ensure_one()
 
-        journal = self.env['account.journal'].search([
-            ('type', '=', 'sale'),
-            ('company_id', '=', self.company_id.id)], limit=1)
-
         move_line_domain = self._get_move_line_domains(to_date)
 
         # Check if a filter is set
@@ -154,7 +170,7 @@ class ResCompanyInterest(models.Model):
             fields=fields,
             groupby=[groupby],
         )
-
+        
         self = self.with_context(
             company_id=self.company_id.id,
             mail_notrack=True,
@@ -163,19 +179,28 @@ class ResCompanyInterest(models.Model):
         total_items = len(grouped_lines)
         _logger.info('%s interest invoices will be generated', total_items)
         for idx, line in enumerate(grouped_lines):
-
+            
+            _logger.info(
+                'Creating Interest Invoice (%s of %s) with values:\n%s',
+                idx + 1, total_items, line)
+            
             debt = line['amount_residual']
 
             if not debt or debt <= 0.0:
                 _logger.info("Debt is negative, skipping...")
                 continue
 
-            _logger.info(
-                'Creating Interest Invoice (%s of %s) with values:\n%s',
-                idx + 1, total_items, line)
             partner_id = line[groupby][0]
 
             partner = self.env['res.partner'].browse(partner_id)
+
+            # Necesitamos que la factura a generar se cree en un diaro compatible, simulamos crear una nota de debito
+            # para que el odoo auto calcule el diario mas recomendable y usamos ese para crear las factura de interes
+            # relacionada a cada partner
+            journal = self.env['account.move'].with_context(
+                internal_type='debit_note', default_move_type='out_invoice').new(
+                    {'partner_id': partner_id, 'move_type': 'out_invoice'}).journal_id
+
             move_vals = self._prepare_interest_invoice(
                 partner, debt, to_date, journal)
 
@@ -228,7 +253,7 @@ class ResCompanyInterest(models.Model):
                 "price_unit": self.rate * debt,
                 "partner_id": partner.id,
                 "name": self.interest_product_id.name + '.\n' + comment,
-                "analytic_line_ids": self.analytic_line_ids.id,
+                "analytic_distribution": {self.analytic_account_id.id: 100.0} if self.analytic_account_id.id else False,
                 "tax_ids": [(6, 0, tax_id.ids)]
             })],
         }
